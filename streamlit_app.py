@@ -2,119 +2,191 @@ import time
 import streamlit as st
 import requests
 import os
+from typing import Dict, List, Optional
+
 
 # Configuration - use environment variables
-BASE_URL = os.getenv('BASE_URL', 'https://staging-api.alta-group.eu/')
-DJANGO_API_URL = os.getenv('DJANGO_API_URL', f'{BASE_URL}api/ai-assistant')
+BASE_URL = os.getenv('BASE_URL', 'https://staging-api.alta-group.eu')
+DJANGO_API_URL = os.getenv('DJANGO_API_URL', f'{BASE_URL}/api/v1/ai-assistant')
+AUTH_URL = os.getenv('AUTH_URL', f'{BASE_URL}/api/token/')
+
 # Initialize session state
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-    st.session_state.message_count = 0
+def initialize_session_state():
+    """Initialize all session state variables"""
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+        st.session_state.message_count = 0
+        st.session_state.auth_token = None
+        st.session_state.auth_failed = False
+        st.session_state.org_mapping = {
+            "Generic Index": "rag-docs-index",
+            "Alirec": "alirec-index",
+            "Stad Koksijde": "stad-kiksijde"
+        }
 
-# Streamlit UI
+
+initialize_session_state()
+
+# Streamlit UI Configuration
+st.set_page_config(
+    page_title="EPC AI Assistant",
+    # page_icon="",
+    layout="wide"
+)
+
+# Custom CSS for better styling
+st.markdown("""
+    <style>
+    .stChatMessage {
+        padding: 12px;
+        border-radius: 8px;
+        margin-bottom: 12px;
+    }
+    .user-message {
+        background-color: #f0f2f6;
+    }
+    .assistant-message {
+        background-color: #e6f7ff;
+    }
+    .citation-header {
+        font-size: 0.9em;
+        color: #555;
+    }
+    .stButton>button {
+        width: 100%;
+        border: 1px solid #ddd;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+
+# Sidebar Configuration
+def render_sidebar() -> Optional[str]:
+    """Render the sidebar and return selected organization ID"""
+    with st.sidebar:
+        st.title("Settings")
+
+        # Organization selection
+        selected_org_name = st.selectbox(
+            "Select Organization",
+            options=list(st.session_state.org_mapping.keys()),
+            index=0,
+            help="Select Organization"
+        )
+
+        # Authentication
+        with st.form("auth_form"):
+            st.header("Authentication")
+            email = st.text_input("Email", placeholder="your.email@example.com")
+            password = st.text_input("Password", type="password")
+
+            if st.form_submit_button("Login"):
+                try:
+                    response = requests.post(
+                        AUTH_URL,
+                        data={"email": email, "password": password},
+                        timeout=10
+                    )
+                    response.raise_for_status()
+                    st.session_state.auth_token = response.json()['access']
+                    st.session_state.auth_failed = False
+                    st.success("Authentication successful")
+                except Exception as e:
+                    st.session_state.auth_failed = True
+                    st.error(f"Authentication failed: {str(e)}")
+
+        if st.session_state.auth_token:
+            st.success("✅ Logged in")
+        elif st.session_state.auth_failed:
+            st.error("❌ Login required")
+
+        return st.session_state.org_mapping.get(selected_org_name)
+
+
+selected_org_id = render_sidebar()
+
+# Main UI
 st.title("EPC AI Assistant")
-
-# Sidebar configuration
-with st.sidebar:
-    st.header("Settings")
-    organizations = [
-        {"name": "Not Selected", "key": "rag-docs-index"},
-        {"name": "Alirec", "key": "alirec-index"},
-        {"name": "Stad Koksijde", "key": "stad-kiksijde"}
-    ]
-
-    # Create mapping of organization names to IDs
-    org_options = {org['name']: org['key'] for org in organizations}
-
-    # Organization selection dropdown
-    selected_org_name = st.selectbox(
-        "Select Organization",
-        options=list(org_options.keys()),
-        index=0,
-        help="Select organization"
-    )
-    selected_org_id = org_options[selected_org_name]
-    email = st.text_input("Email", placeholder="Your email address")
-    password = st.text_input("Password", placeholder="Your password", type="password")
+st.caption("Ask questions about EPC processes and get AI-powered answers with references")
 
 
-def render_citation(citation, message_id, citation_idx):
+# Chat History Rendering
+def render_citation(citation: Dict, message_id: int, citation_idx: int):
     """Render a single citation with toggle functionality"""
     toggle_key = f"show_citation_{message_id}_{citation_idx}"
 
-    # Initialize toggle state if not exists
     if toggle_key not in st.session_state:
         st.session_state[toggle_key] = False
-    # Create a container for the citation
+
     with st.container():
-    #     # Citation header with toggle button
         col1, col2 = st.columns([0.9, 0.1])
+
         with col1:
             title = citation.get('title', 'Untitled Document')
-            if st.button(f"Reference {citation_idx + 1}: {title}",
-                         key=f"citation-header-{message_id}-{citation_idx}",
-                         help="Click to show/hide reference content"):
+            if st.button(
+                    f"📄 {title}",
+                    key=f"citation-btn-{message_id}-{citation_idx}",
+                    help="Click to view reference content"
+            ):
                 st.session_state[toggle_key] = not st.session_state[toggle_key]
+
         with col2:
             if citation.get('url'):
                 st.markdown(f"[🔗]({citation['url']})", unsafe_allow_html=True)
 
-        # Citation content (shown if expanded)
         if st.session_state[toggle_key]:
-            with st.expander(f"Reference {citation_idx + 1}: {title}", expanded=True):
+            with st.expander(f"Reference Content", expanded=True):
                 st.markdown(citation.get('content', 'No content available'))
+                if citation.get('score'):
+                    st.caption(f"Relevance score: {citation['score']:.2f}")
 
 
-def render_references(citations, message_id):
-    """Render all citations for a message"""
-    if not citations:
-        return
-
-    st.markdown("**References**")
-    for idx, citation in enumerate(citations):
-        render_citation(citation, message_id, idx)
-
-
-# Display chat history with toggleable citations
-for i, message in enumerate(st.session_state.messages):
+def render_message(message: Dict):
+    """Render a single chat message with citations"""
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
         if message.get("citations"):
-            # Use the message's unique ID if it exists, otherwise use index
-            message_id = message.get("id", i)
-            render_references(message["citations"], message_id)
+            st.markdown("---")
+            st.markdown("**References**")
+            for idx, citation in enumerate(message["citations"]):
+                render_citation(citation, message["id"], idx)
 
-# Chat input
+
+# Display chat history
+for message in st.session_state.messages:
+    render_message(message)
+
+# Chat Input and Processing
 if prompt := st.chat_input("Ask about EPC processes..."):
-    # Add message with unique ID
+    if not st.session_state.auth_token:
+        st.error("Please login first")
+        st.stop()
+
+    # Add user message to history
     st.session_state.message_count += 1
-    new_message = {
+    user_message = {
         "id": st.session_state.message_count,
         "role": "user",
         "content": prompt,
         "organization_id": selected_org_id
     }
-    st.session_state.messages.append(new_message)
+    st.session_state.messages.append(user_message)
 
-    with st.chat_message("user"):
+    # Display user message immediately
+    with st.chat_message("user", avatar="🧑"):
         st.markdown(prompt)
 
-    with st.chat_message("assistant"):
+    # Prepare and display assistant response
+    with st.chat_message("assistant", avatar="🤖"):
         response_placeholder = st.empty()
         full_response = ""
 
         try:
-            # Authenticate and get token
-            auth_response = requests.post(
-                f'{BASE_URL}api/token/',
-                data={"email": email, "password": password}
-            )
-            auth_response.raise_for_status()
-            token = auth_response.json()['access']
+            # Call Django RAG API
+            with st.spinner("Researching your question..."):
+                start_time = time.time()
 
-            # Call Django API
-            with st.spinner("Generating response..."):
                 response = requests.post(
                     DJANGO_API_URL,
                     json={
@@ -122,7 +194,7 @@ if prompt := st.chat_input("Ask about EPC processes..."):
                         "message": prompt
                     },
                     headers={
-                        "Authorization": f"Bearer {token}",
+                        "Authorization": f"Bearer {st.session_state.auth_token}",
                         "Content-Type": "application/json"
                     },
                     timeout=30
@@ -130,32 +202,43 @@ if prompt := st.chat_input("Ask about EPC processes..."):
                 response.raise_for_status()
                 data = response.json()
 
-                # Stream response
+                # Stream the response
                 for chunk in data["content"].split():
                     full_response += chunk + " "
                     response_placeholder.markdown(full_response + "▌")
-                    time.sleep(0.05)
+                    time.sleep(0.03)
 
                 response_placeholder.markdown(full_response)
 
-                # Add assistant response with unique ID
+                # Add assistant response to history
                 st.session_state.message_count += 1
                 assistant_message = {
                     "id": st.session_state.message_count,
                     "role": "assistant",
                     "content": full_response,
                     "citations": data.get("citations", []),
-                    "organization_id": selected_org_id
+                    "organization_id": selected_org_id,
+                    "response_time": time.time() - start_time
                 }
                 st.session_state.messages.append(assistant_message)
 
-                # Render references for the new message
+                # Show references if available
                 if data.get("citations"):
-                    render_references(data["citations"], st.session_state.message_count)
+                    st.markdown("---")
+                    st.markdown("**References**")
+                    for idx, citation in enumerate(data["citations"]):
+                        render_citation(citation, st.session_state.message_count, idx)
 
+        except requests.exceptions.HTTPError as e:
+            st.error(f"API Error: {e.response.text}")
         except requests.exceptions.RequestException as e:
-            st.error(f"API Error: {str(e)}")
-        except KeyError:
-            st.error("Authentication failed. Please check your credentials.")
+            st.error(f"Network Error: {str(e)}")
         except Exception as e:
             st.error(f"Unexpected error: {str(e)}")
+
+# Add clear conversation button
+if st.session_state.messages and st.sidebar.button("Clear Conversation"):
+    st.session_state.messages = []
+    st.session_state.message_count = 0
+    st.rerun()
+
