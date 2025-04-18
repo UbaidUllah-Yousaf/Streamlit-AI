@@ -4,11 +4,10 @@ import requests
 import os
 from typing import Dict, List, Optional
 
+# Configuration
+DJANGO_API_URL = os.getenv('DJANGO_API_URL', 'http://localhost:8000/api/v1/ai-assistant')
+AUTH_URL = os.getenv('AUTH_URL', 'http://localhost:8000/api/token/')
 
-# Configuration - use environment variables
-BASE_URL = os.getenv('BASE_URL', 'https://staging-api.alta-group.eu')
-DJANGO_API_URL = os.getenv('DJANGO_API_URL', f'{BASE_URL}/api/v1/ai-assistant')
-AUTH_URL = os.getenv('AUTH_URL', f'{BASE_URL}/api/token/')
 
 # Initialize session state
 def initialize_session_state():
@@ -20,8 +19,8 @@ def initialize_session_state():
         st.session_state.auth_failed = False
         st.session_state.org_mapping = {
             "Generic Index": "rag-docs-index",
-            "Alirec": "alirec-index",
-            "Stad Koksijde": "stad-kiksijde"
+            "Alirec": "alirec",
+            "Stad Koksijde": "stad-koksijde"
         }
 
 
@@ -174,11 +173,11 @@ if prompt := st.chat_input("Ask about EPC processes..."):
     st.session_state.messages.append(user_message)
 
     # Display user message immediately
-    with st.chat_message("user", avatar="🧑"):
+    with st.chat_message("user"):
         st.markdown(prompt)
 
     # Prepare and display assistant response
-    with st.chat_message("assistant", avatar="🤖"):
+    with st.chat_message("assistant"):
         response_placeholder = st.empty()
         full_response = ""
 
@@ -241,4 +240,3 @@ if st.session_state.messages and st.sidebar.button("Clear Conversation"):
     st.session_state.messages = []
     st.session_state.message_count = 0
     st.rerun()
-
