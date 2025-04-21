@@ -5,8 +5,8 @@ import os
 from typing import Dict, List, Optional
 
 # Configuration
-DJANGO_API_URL = os.getenv('DJANGO_API_URL', 'http://localhost:8000/api/v1/ai-assistant')
-AUTH_URL = os.getenv('AUTH_URL', 'http://localhost:8000/api/token/')
+DJANGO_API_URL = os.getenv('DJANGO_API_URL', 'https://staging.alta-group.eu/api/v1/ai-assistant')
+AUTH_URL = os.getenv('AUTH_URL', 'https://staging.alta-group.eu/api/token/')
 
 
 # Initialize session state
@@ -178,6 +178,7 @@ if prompt := st.chat_input("Ask about EPC processes..."):
 
     # Prepare and display assistant response
     with st.chat_message("assistant"):
+
         response_placeholder = st.empty()
         full_response = ""
 
