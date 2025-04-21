@@ -20,7 +20,8 @@ def initialize_session_state():
         st.session_state.org_mapping = {
             "Generic Index": "rag-docs-index",
             "Alirec": "alirec",
-            "Stad Koksijde": "stad-koksijde"
+            "Stad Koksijde": "stad-koksijde",
+            "Vabeld": "vabeld"
         }
 
 
