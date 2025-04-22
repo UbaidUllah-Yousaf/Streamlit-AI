@@ -1,3 +1,4 @@
+import json
 import time
 import streamlit as st
 import requests
@@ -30,7 +31,6 @@ initialize_session_state()
 # Streamlit UI Configuration
 st.set_page_config(
     page_title="EPC AI Assistant",
-    # page_icon="",
     layout="wide"
 )
 
@@ -141,12 +141,74 @@ def render_citation(citation: Dict, message_id: int, citation_idx: int):
                     st.caption(f"Relevance score: {citation['score']:.2f}")
 
 
+import re
+import json
+from typing import Dict, Tuple
+
+
+def extract_json_from_markdown(markdown_text: str) -> Dict:
+    """Extract JSON from markdown code block"""
+    # Pattern to match ```json {...} ```
+    json_pattern = r'```json\n(.*?)\n```'
+    match = re.search(json_pattern, markdown_text, re.DOTALL)
+
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            return {"answer": markdown_text, "info": "0"}
+    return {"answer": markdown_text, "info": "0"}
+
+
+def format_response(response_data: (Dict, str)) -> Tuple[str, str]:
+    """Format the API response and return (answer, info) tuple"""
+    try:
+        # Handle markdown-wrapped JSON
+        if isinstance(response_data, str) and '```json' in response_data:
+            response_data = extract_json_from_markdown(response_data)
+
+        # Handle regular JSON string
+        elif isinstance(response_data, str):
+            try:
+                response_data = json.loads(response_data)
+            except json.JSONDecodeError:
+                return response_data, "0"
+
+        # Extract answer and info
+        answer = response_data.get("answer", "No answer provided")
+        info = response_data.get("info", "0")
+
+        return answer, info
+
+    except Exception as e:
+        st.error(f"Error formatting response: {str(e)}")
+        return "Could not process the response", "0"
+
+
 def render_message(message: Dict):
     """Render a single chat message with citations"""
     with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+        if message["role"] == "assistant":
+            if isinstance(message["content"], (dict, str)):
+                # Get both answer and info status
+                answer, info = format_response(message["content"])
 
-        if message.get("citations"):
+                # Display the answer with markdown formatting
+                st.markdown(answer)
+
+                # Show warning if info is "0"
+                if info == "0" and message["content"]:
+                    st.warning(
+                        "Unable to find relevant information in the provided index. "
+                        "This is a general answer that may not be specific to your query.",
+                        icon="⚠️"
+                    )
+            else:
+                st.markdown(str(message["content"]))
+        else:
+            st.markdown(message["content"])
+
+        if message.get("citations") and info != "0" and message["content"]:
             st.markdown("---")
             st.markdown("**References**")
             for idx, citation in enumerate(message["citations"]):
@@ -174,68 +236,57 @@ if prompt := st.chat_input("Ask about EPC processes..."):
     st.session_state.messages.append(user_message)
 
     # Display user message immediately
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    render_message(user_message)  # Changed from direct st.chat_message() to use render_message
 
-    # Prepare and display assistant response
-    with st.chat_message("assistant"):
+    # Prepare assistant response
+    full_response = ""
+    try:
+        # Call Django RAG API
+        with st.spinner("Researching your question..."):
+            start_time = time.time()
 
-        response_placeholder = st.empty()
-        full_response = ""
+            response = requests.post(
+                DJANGO_API_URL,
+                json={
+                    "organization": selected_org_id,
+                    "message": prompt
+                },
+                headers={
+                    "Authorization": f"Bearer {st.session_state.auth_token}",
+                    "Content-Type": "application/json"
+                },
+                timeout=60
+            )
+            response.raise_for_status()
+            data = response.json()
 
-        try:
-            # Call Django RAG API
-            with st.spinner("Researching your question..."):
-                start_time = time.time()
+            # Handle both simple answer format and full RAG response
+            if "answer" in data:
+                full_response = data
+            else:
+                full_response = data.get("content", {})
 
-                response = requests.post(
-                    DJANGO_API_URL,
-                    json={
-                        "organization": selected_org_id,
-                        "message": prompt
-                    },
-                    headers={
-                        "Authorization": f"Bearer {st.session_state.auth_token}",
-                        "Content-Type": "application/json"
-                    },
-                    timeout=60
-                )
-                response.raise_for_status()
-                data = response.json()
+            # Add assistant response to history
+            st.session_state.message_count += 1
+            assistant_message = {
+                "id": st.session_state.message_count,
+                "role": "assistant",
+                "content": full_response,
+                "citations": data.get("citations", []),
+                "organization_id": selected_org_id,
+                "response_time": time.time() - start_time
+            }
+            st.session_state.messages.append(assistant_message)
 
-                # Stream the response
-                for chunk in data["content"].split():
-                    full_response += chunk + " "
-                    response_placeholder.markdown(full_response + "▌")
-                    time.sleep(0.03)
+            # Display the message
+            render_message(assistant_message)  # This will handle the chat message rendering
 
-                response_placeholder.markdown(full_response)
-
-                # Add assistant response to history
-                st.session_state.message_count += 1
-                assistant_message = {
-                    "id": st.session_state.message_count,
-                    "role": "assistant",
-                    "content": full_response,
-                    "citations": data.get("citations", []),
-                    "organization_id": selected_org_id,
-                    "response_time": time.time() - start_time
-                }
-                st.session_state.messages.append(assistant_message)
-
-                # Show references if available
-                if data.get("citations"):
-                    st.markdown("---")
-                    st.markdown("**References**")
-                    for idx, citation in enumerate(data["citations"]):
-                        render_citation(citation, st.session_state.message_count, idx)
-
-        except requests.exceptions.HTTPError as e:
-            st.error(f"API Error: {e.response.text}")
-        except requests.exceptions.RequestException as e:
-            st.error(f"Network Error: {str(e)}")
-        except Exception as e:
-            st.error(f"Unexpected error: {str(e)}")
+    except requests.exceptions.HTTPError as e:
+        st.error(f"API Error: {e.response.text}")
+    except requests.exceptions.RequestException as e:
+        st.error(f"Network Error: {str(e)}")
+    except Exception as e:
+        st.error(f"Unexpected error: {str(e)}")
 
 # Add clear conversation button
 if st.session_state.messages and st.sidebar.button("Clear Conversation"):
