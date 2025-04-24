@@ -19,6 +19,7 @@ def initialize_session_state():
         st.session_state.auth_token = None
         st.session_state.auth_failed = False
         st.session_state.org_mapping = {
+            "Test": 'test-index',
             "Generic Index": "rag-docs-index",
             "Alirec": "alirec",
             "Stad Koksijde": "stad-koksijde",
@@ -186,7 +187,6 @@ def format_response(response_data: (Dict, str)) -> Tuple[str, str]:
 
 
 def render_message(message: Dict):
-    """Render a single chat message with citations"""
     with st.chat_message(message["role"]):
         if message["role"] == "assistant":
             if isinstance(message["content"], (dict, str)):
@@ -208,10 +208,10 @@ def render_message(message: Dict):
         else:
             st.markdown(message["content"])
 
-        if message.get("citations") and info != "0" and message["content"]:
+        if message.get("retrieved_documents") and info != "0" and message["content"]:
             st.markdown("---")
             st.markdown("**References**")
-            for idx, citation in enumerate(message["citations"]):
+            for idx, citation in enumerate(message["retrieved_documents"]):
                 render_citation(citation, message["id"], idx)
 
 
@@ -274,7 +274,8 @@ if prompt := st.chat_input("Ask about EPC processes..."):
                 "content": full_response,
                 "citations": data.get("citations", []),
                 "organization_id": selected_org_id,
-                "response_time": time.time() - start_time
+                "response_time": time.time() - start_time,
+                "retrieved_documents": data.get("retrieved_documents")
             }
             st.session_state.messages.append(assistant_message)
 
