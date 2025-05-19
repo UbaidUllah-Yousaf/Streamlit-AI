@@ -6,7 +6,7 @@ import os
 from typing import Dict, List, Optional
 
 # Configuration
-DJANGO_API_URL = os.getenv('DJANGO_API_URL', 'https://staging-api.alta-group.eu/api/ai-assistant')
+DJANGO_API_URL = os.getenv('DJANGO_API_URL', 'https://staging-api.alta-group.eu/api/v1/ai-assistant')
 AUTH_URL = os.getenv('AUTH_URL', 'https://staging-api.alta-group.eu/api/token/')
 
 
