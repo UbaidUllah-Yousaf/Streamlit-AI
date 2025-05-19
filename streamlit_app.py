@@ -6,7 +6,7 @@ import os
 from typing import Dict, List, Optional
 
 # Configuration
-DJANGO_API_URL = os.getenv('DJANGO_API_URL', 'https://staging-api.alta-group.eu/api/v1/ai-assistant')
+DJANGO_API_URL = os.getenv('DJANGO_API_URL', 'https://staging-api.alta-group.eu/api/ai-assistant')
 AUTH_URL = os.getenv('AUTH_URL', 'https://staging-api.alta-group.eu/api/token/')
 
 
@@ -248,7 +248,7 @@ if prompt := st.chat_input("Ask about EPC processes..."):
             response = requests.post(
                 DJANGO_API_URL,
                 json={
-                    "organization": selected_org_id,
+                    "organization_name": selected_org_id,
                     "message": prompt
                 },
                 headers={
