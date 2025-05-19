@@ -11,6 +11,9 @@ AUTH_URL = os.getenv('AUTH_URL', 'https://staging-api.alta-group.eu/api/token/')
 
 
 # Initialize session state
+
+
+# Initialize session state
 def initialize_session_state():
     """Initialize all session state variables"""
     if "messages" not in st.session_state:
@@ -248,7 +251,7 @@ if prompt := st.chat_input("Ask about EPC processes..."):
             response = requests.post(
                 DJANGO_API_URL,
                 json={
-                    "organization_name": selected_org_id,
+                    "organization": selected_org_id,
                     "message": prompt
                 },
                 headers={
