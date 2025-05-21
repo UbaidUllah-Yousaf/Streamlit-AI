@@ -23,6 +23,7 @@ def initialize_session_state():
         st.session_state.auth_failed = False
         st.session_state.org_mapping = {
             "Generic Index": "generic",
+            "Generic (LLM)": "llm",
             "Alirec": "alirec",
             "Stad Koksijde": "stad-koksijde",
             "Vabeld": "vabeld"
