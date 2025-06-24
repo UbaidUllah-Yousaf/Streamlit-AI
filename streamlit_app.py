@@ -1,380 +1,324 @@
-# rag_service.py
-import re
 import json
-import logging
 import time
-from typing import List, Dict, Optional
+import streamlit as st
+import requests
+import os
+import uuid
+from typing import Dict, List, Optional
 
-from azure.ai.inference.models import SystemMessage, UserMessage, AssistantMessage
-from azure.core.credentials import AzureKeyCredential
-from azure.core.exceptions import AzureError
-from azure.search.documents import SearchClient
-from django.conf import settings
-from openai import AzureOpenAI
-
-from building.models import SiteDocument
-from building.models.site_document import AIProcessingChoices
-from utils.const import IMAGES_EXTENSIONS
-from utils.llm_prompts import ORGANIZATION_PROMPT
-from azure.search.documents.models import (
-    VectorizedQuery,
-    QueryType,
-)
-
-# Initialize logging
-logger = logging.getLogger(__name__)
-DEPLOYMENT = settings.DEPLOYMENT_NAME
-endpoint = f"https://rag-openai-docproc-fulcrum.openai.azure.com/openai/deployments/{DEPLOYMENT}"
-
-client = AzureOpenAI(
-    api_version=settings.AZURE_OPENAI_API_VERSION,
-    azure_endpoint=settings.AZURE_RAG_ENDPOINT,
-    api_key=settings.AZURE_OPENAI_API_KEY,
-)
+# Configuration
+DJANGO_API_URL = os.getenv('DJANGO_API_URL', 'http://localhost:8000/api/ai-assistant')
+AUTH_URL = os.getenv('AUTH_URL', 'http://localhost:8000/api/token/')
 
 
-def embed_single(text: str) -> list:
-    return client.embeddings.create(model=settings.EMBEDDING_MODEL, input=text).data[0].embedding
+# Initialize session state
+def initialize_session_state():
+    """Initialize all session state variables"""
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
+    if "message_count" not in st.session_state:
+        st.session_state.message_count = 0
 
-class ConversationContext:
-    """
-    Class to manage conversation history and context
-    """
+    if "auth_token" not in st.session_state:
+        st.session_state.auth_token = None
 
-    def __init__(self, max_history=3):
-        self.history = []
-        self.max_history = max_history
+    if "auth_failed" not in st.session_state:
+        st.session_state.auth_failed = False
 
-    def add_message(self, role: str, content: str):
-        """Add a message to the conversation history"""
-        self.history.append({"role": role, "content": content})
-        # Keep only the most recent messages
-        if len(self.history) > self.max_history * 2:  # *2 because each turn has user+assistant
-            self.history = self.history[-self.max_history * 2:]
-
-    def get_context_messages(self) -> List[Dict]:
-        """Get the conversation history in message format"""
-        return self.history.copy()
-
-    def clear(self):
-        """Clear the conversation history"""
-        self.history = []
-
-
-class RAGService:
-    """
-    Comprehensive RAG service with conversation context support
-    """
-
-    def __init__(self, context_messages: Optional[List[Dict]] = None):
-        self.llm_client = ChatCompletionsClient(
-            endpoint=endpoint,
-            credential=AzureKeyCredential(settings.AZURE_OPENAI_API_KEY)
-        )
-        self.conversation_context = ConversationContext(max_history=3)
-
-        if context_messages:
-            for msg in context_messages:
-                self.conversation_context.add_message(msg['role'], msg['content'])
-
-    def query(
-            self,
-            user_message: str,
-            index_name: str,
-            organization_id: Optional[str] = None,
-            site_id: Optional[str] = None,
-            conversation_id: Optional[str] = None,
-    ) -> Dict:
-        """
-        Query documents with organization/site context and conversation history
-
-        Args:
-            user_message: The user's query
-            index_names: List of indexes to query
-            organization_id: Optional organization ID for filtering
-            site_id: Optional site ID for filtering
-            conversation_id: Optional conversation ID for tracking context
-
-        Returns:
-            Dictionary with query results and updated context
-        """
-        if not index_name:
-            raise ValueError("At least one index name must be provided")
-
-        self.conversation_context.add_message("user", user_message)
-
-        # Add context to the query
-        context_prompt = ""
-        with open('open_api/prompts/rag_prompt_2', 'r') as file:
-            context_prompt = file.read()
-
-        # Include conversation history in the prompt
-        conversation_history = "\n".join(
-            f"{msg['role']}: {msg['content']}"
-            for msg in self.conversation_context.get_context_messages()
-        )
-
-        full_prompt = f"""
-        Conversation History:
-        {conversation_history}
-
-        Current Question:
-        {user_message}
-
-        Context:
-        {context_prompt}
-        """
-        status_code = 429
-        while status_code == 429:
-            try:
-                results, show_references = self._query_single_index(
-                    full_prompt, index_name, True
-                )
-                if 'json' not in results['content']:
-                    data = json.loads(results['content'])
-                    info = data['info']
-                    references = get_references(results['citations'], organization_id, show_references)
-                    return {"semantics": references, "data": json.dumps(data), "info": info, "answer": data['answer']}
-
-                data = json.loads(results['content'].replace('```', '').replace('json', ''))
-                info = data['info']
-                references = get_references(results['citations'], organization_id, show_references)
-                return {"semantics": references, "data": json.dumps(data), "info": info, "answer": data['answer']}
-
-            except AzureError as e:
-                match = re.search(r'Try again in (\d+) seconds', str(e))
-                if match:
-                    remaining_seconds = int(match.group(1))
-                    time.sleep(remaining_seconds)
-                    continue
-                else:
-                    status_code = 200
-
-    def _query_single_index(
-            self, user_message: str, index_name: str,  semantic: bool = None
-    ) -> dict:
-        """
-        Query a single search index with conversation context
-        """
-        system_prompt = ORGANIZATION_PROMPT
-        messages = [SystemMessage(content=system_prompt)]
-
-        # Add conversation history
-        for msg in self.conversation_context.get_context_messages():
-            if msg['role'] == 'user':
-                messages.append(UserMessage(content=msg['content']))
-            elif msg['role'] == 'assistant':
-                messages.append(AssistantMessage(content=msg['content']))
-
-        # Add current user message with info placeholder
-        formatted_user_message = f"""
-        ___
-        [Current Question]
-        {user_message}
-        ___
-        [Info]
-        {{info}}  # Will be filled by RAG
-        ___
-        """
-        messages.append(UserMessage(content=formatted_user_message))
-        status_code = 429
-        try:
-            while status_code == 429:
-                response = self.llm_client.complete(
-                    messages=messages,
-                    max_tokens=2200,
-                    temperature=0.7,
-                    top_p=0.95,
-                    frequency_penalty=0,
-                    presence_penalty=0,
-                    stop=None,
-                    stream=False,
-                    model=settings.DEPLOYMENT_NAME,
-                    model_extras={
-                        "response_format": {
-                            "format": "structured",
-                            "options": {
-                                "include_references": True,
-                                "highlight_citations": True,
-                                "citation_style": "numbered"
-                            }
-                        },
-                        "data_sources": [{
-                            "type": "azure_search",
-                            "parameters": {
-                                "role_information": "EPC AI Assistant",
-                                "endpoint": settings.AZURE_SEARCH_ENDPOINT,
-                                "index_name": index_name,
-                                "query_type": "vector_simple_hybrid",
-                                "fields_mapping": {
-                                    "content_fields": ["content"],
-                                    "title_field": "title",
-                                    "url_field": "url",
-                                    "filepath_field": "file_name",
-                                },
-                                "strictness": 5,
-                                "top_n_documents": 5,
-                                "embedding_dependency": {
-                                    "type": "deployment_name",
-                                    "deployment_name": settings.EMBEDDING_MODEL
-                                },
-                                "authentication": {
-                                    "type": "api_key",
-                                    "key": settings.AZURE_SEARCH_KEY
-                                },
-                            }
-                        }]
-                    } if semantic else {}
-                )
-                if "The requested information is not found in the retrieved data. Please try another query or topic" in str(response) and semantic:
-                    semantic = False
-                    continue
-
-                status_code = 200
-
-            return self._process_response(response), semantic
-
-        except Exception as e:
-            if "Server responded with status 429" in str(e):
-                match = re.search(r'Try again in (\d+) seconds', str(e))
-                if match:
-                    remaining_seconds = int(match.group(1))
-                    print("Retry after:", remaining_seconds, "seconds")
-                    time.sleep(remaining_seconds)
-            else:
-                status_code = 200
-
-    def _process_response(self, response) -> dict:
-        """
-        Process the LLM response into a standardized format.
-
-        Args:
-            response: The raw response from the LLM
-
-        Returns:
-            Processed response dictionary
-        """
-        content = response.choices[0].message.content
-        citations = response.choices[0].message.get('context')
-        citations = citations['citations'] if citations else []
-        content = re.sub(r"\[\w+\]", "", content).strip()  # Remove citation markers
-
-        return {
-            "content": content,
-            "citations": citations
+    if "org_mapping" not in st.session_state:
+        st.session_state.org_mapping = {
+            "test": "9",
         }
 
-    def search_with_semantic_and_vector(self, text, index_name, top=5):
-        if index_name == "combined":
-            return []
+    if "conversation_id" not in st.session_state:
+        st.session_state.conversation_id = None
 
+    if "new_conversation" not in st.session_state:
+        st.session_state.new_conversation = True
+
+
+initialize_session_state()
+
+# Streamlit UI Configuration
+st.set_page_config(
+    page_title="EPC AI Assistant",
+    layout="wide"
+)
+
+# Custom CSS for better styling
+st.markdown("""
+    <style>
+    .stChatMessage {
+        padding: 12px;
+        border-radius: 8px;
+        margin-bottom: 12px;
+    }
+    .user-message {
+        background-color: #f0f2f6;
+    }
+    .assistant-message {
+        background-color: #e6f7ff;
+    }
+    .citation-header {
+        font-size: 0.9em;
+        color: #555;
+    }
+    .stButton>button {
+        width: 100%;
+        border: 1px solid #ddd;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+
+# Sidebar Configuration
+def render_sidebar() -> Optional[str]:
+    """Render the sidebar and return selected organization ID"""
+    with st.sidebar:
+        st.title("Settings")
+
+        # Organization selection
+        selected_org_name = st.selectbox(
+            "Select Organization",
+            options=list(st.session_state.org_mapping.keys()),
+            index=0,
+            help="Select Organization"
+        )
+
+        # Authentication
+        with st.form("auth_form"):
+            st.header("Authentication")
+            email = st.text_input("Email", placeholder="your.email@example.com")
+            password = st.text_input("Password", type="password")
+
+            if st.form_submit_button("Login"):
+                try:
+                    response = requests.post(
+                        AUTH_URL,
+                        data={"email": email, "password": password},
+                        timeout=10
+                    )
+                    response.raise_for_status()
+                    st.session_state.auth_token = response.json()['access']
+                    st.session_state.auth_failed = False
+                    st.success("Authentication successful")
+                except Exception as e:
+                    st.session_state.auth_failed = True
+                    st.error(f"Authentication failed: {str(e)}")
+
+        if st.session_state.auth_token:
+            st.success("✅ Logged in")
+        elif st.session_state.auth_failed:
+            st.error("❌ Login required")
+
+        return st.session_state.org_mapping.get(selected_org_name)
+
+
+selected_org_id = render_sidebar()
+
+# Main UI
+st.title("EPC AI Assistant")
+st.caption("Ask questions about EPC processes and get AI-powered answers with references")
+
+
+# Chat History Rendering
+def render_citation(citation: Dict, message_id: int, citation_idx: int):
+    """Render a single citation with toggle functionality"""
+    toggle_key = f"show_citation_{message_id}_{citation_idx}"
+
+    if toggle_key not in st.session_state:
+        st.session_state[toggle_key] = False
+
+    with st.container():
+        col1, col2 = st.columns([0.9, 0.1])
+
+        with col1:
+            title = citation.get('title', 'Untitled Document')
+            if st.button(
+                    f"📄 {title}",
+                    key=f"citation-btn-{message_id}-{citation_idx}",
+                    help="Click to view reference content"
+            ):
+                st.session_state[toggle_key] = not st.session_state[toggle_key]
+
+        with col2:
+            if citation.get('url'):
+                st.markdown(f"[🔗]({citation['url']})", unsafe_allow_html=True)
+
+        if st.session_state[toggle_key]:
+            with st.expander(f"Reference Content", expanded=True):
+                st.markdown(citation.get('content', 'No content available'), unsafe_allow_html=True)
+                if citation.get('score'):
+                    st.caption(f"Relevance score: {citation['score']:.2f}")
+
+
+import re
+import json
+from typing import Dict, Tuple
+
+
+def extract_json_from_markdown(markdown_text: str) -> Dict:
+    """Extract JSON from markdown code block"""
+    # Pattern to match ```json {...} ```
+    json_pattern = r'```json\n(.*?)\n```'
+    match = re.search(json_pattern, markdown_text, re.DOTALL)
+
+    if match:
         try:
-            # Initialize search client with modern timeout configuration
-            search_client = SearchClient(
-                endpoint=settings.AZURE_SEARCH_ENDPOINT,
-                index_name=index_name,
-                credential=AzureKeyCredential(settings.AZURE_SEARCH_KEY),
-                client_options={"connection_timeout": 10, "read_timeout": 30}
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            return {"answer": markdown_text, "info": "0"}
+    return {"answer": markdown_text, "info": "0"}
+
+
+def format_response(response_data: (Dict, str)) -> Tuple[str, str]:
+    """Format the API response and return (answer, info) tuple"""
+    try:
+        # Handle markdown-wrapped JSON
+        if isinstance(response_data, str) and '```json' in response_data:
+            response_data = extract_json_from_markdown(response_data)
+
+        # Handle regular JSON string
+        elif isinstance(response_data, str):
+            try:
+                response_data = json.loads(response_data)
+            except json.JSONDecodeError:
+                return response_data, "0"
+
+        # Extract answer and info
+        answer = response_data.get("answer", "No answer provided")
+        info = response_data.get("info", "0")
+
+        return answer, info
+
+    except Exception as e:
+        st.error(f"Error formatting response: {str(e)}")
+        return "Could not process the response", "0"
+
+
+def render_message(message: Dict):
+    with st.chat_message(message["role"]):
+        if message["role"] == "assistant":
+            if isinstance(message["content"], (dict, str)):
+                # Get both answer and info status
+                answer, info = format_response(message["content"])
+
+                # Display the answer with markdown formatting
+                st.markdown(answer)
+
+                # Show warning if info is "0"
+                if info == "0" and message["content"]:
+                    st.warning(
+                        "Unable to find relevant information in the provided index. "
+                        "This is a general answer that may not be specific to your query.",
+                        icon="⚠️"
+                    )
+            else:
+                st.markdown(str(message["content"]))
+
+        else:
+            st.markdown(message["content"])
+
+        if message.get("retrieved_documents") and message["content"]:
+            st.markdown("---")
+            st.markdown("**References**")
+            for idx, citation in enumerate(message["retrieved_documents"]):
+                render_citation(citation, message["id"], idx)
+
+
+# Display chat history
+for message in st.session_state.messages:
+    render_message(message)
+
+# Chat Input and Processing
+if prompt := st.chat_input("Ask about EPC processes..."):
+    if not st.session_state.auth_token:
+        st.error("Please login first")
+        st.stop()
+
+    # Add user message to history
+    st.session_state.message_count += 1
+    user_message = {
+        "id": st.session_state.message_count,
+        "role": "user",
+        "content": prompt,
+        "organization_id": selected_org_id
+    }
+    st.session_state.messages.append(user_message)
+
+    # Display user message immediately
+    render_message(user_message)
+
+    # Prepare assistant response
+    full_response = ""
+    try:
+        # Prepare request data
+        request_data = {
+            "organization": selected_org_id,
+            "message": prompt,
+            "new_conversation": st.session_state.new_conversation
+        }
+
+        # Only include conversation_id if we have one
+        if st.session_state.conversation_id:
+            request_data["conversation_id"] = ""
+
+        # Call Django RAG API
+        with st.spinner("Researching your question..."):
+            start_time = time.time()
+
+            response = requests.post(
+                DJANGO_API_URL,
+                json=request_data,
+                headers={
+                    "Authorization": f"Bearer {st.session_state.auth_token}",
+                    "Content-Type": "application/json"
+                },
+                timeout=60
             )
+            response.raise_for_status()
+            data = response.json()
 
-            # Enhanced text preprocessing
-            cleaned_text = ' '.join(text.strip().split())  # Normalize whitespace
-            if not cleaned_text or len(cleaned_text) < 3:
-                return []
+            # After first message, it's no longer a new conversation
+            st.session_state.new_conversation = False
 
-            # Create optimized vector query (v11.5.2 syntax)
-            vector_query = VectorizedQuery(
-                vector=embed_single(cleaned_text),
-                k_nearest_neighbors=top,
-                fields="embedding",
-                exhaustive=False,
-            )
+            # Update conversation_id from response if provided
+            if data.get("conversation_id"):
+                st.session_state.conversation_id = data["conversation_id"]
 
-            # Hybrid search with v11.5.2 features
-            search_results = search_client.search(
-                search_text=cleaned_text,
-                vector_queries=[vector_query],
-                query_type=QueryType.SEMANTIC,  # Using enum from models
-                semantic_configuration_name=index_name,
-                top=top,  # Wider candidate pool
-                highlight_fields="content",
-                highlight_pre_tag="<mark>",  # More semantic HTML tag
-                highlight_post_tag="</mark>",
-            )
+            # Handle both simple answer format and full RAG response
+            if "answer" in data:
+                full_response = data
+            else:
+                full_response = data.get("content", {})
 
-            # Advanced result processing
-            seen_hashes = set()
-            final_results = []
+            # Add assistant response to history
+            st.session_state.message_count += 1
+            assistant_message = {
+                "id": st.session_state.message_count,
+                "role": "assistant",
+                "content": full_response,
+                "organization_id": selected_org_id,
+                "response_time": time.time() - start_time,
+                "retrieved_documents": data.get("retrieved_documents", [])
+            }
+            st.session_state.messages.append(assistant_message)
 
-            for result in search_results:
-                # Enhanced duplicate detection
-                content = result.get("content", "")
-                title = result.get("title", "")
-                file_name = result.get("file_name", "")
-                content_hash = hash(f"{title[:100]}:{content[:400]}".lower())
+            # Display the message
+            render_message(assistant_message)
 
-                if content_hash in seen_hashes:
-                    continue
-                seen_hashes.add(content_hash)
+    except requests.exceptions.HTTPError as e:
+        st.error(f"API Error: {e.response.text}")
+    except requests.exceptions.RequestException as e:
+        st.error(f"Network Error: {str(e)}")
+    except Exception as e:
+        st.error(f"Unexpected error: {str(e)}")
 
-                # Normalized score calculation with modern approach
-                vector_norm = min(result["@search.score"] / 0.8, 1.0)  # Normalize vector to 0-1
-                semantic_norm = min(result.get("@search.reranker_score", 0) / 4.0, 1.0)  # Normalize semantic to 0-1
-                combined_score = (0.25 * vector_norm) + (0.75 * semantic_norm)  # Adjusted weights
-
-                # Enhanced highlights processing
-                highlights = result.get("@search.highlights", {})
-                best_highlight = next(iter(highlights.get("content", [])), "") if highlights else ""
-                if best_highlight:
-                    final_results.append({
-                        "score": round(combined_score, 4),
-                        "vector_score": round(result["@search.score"], 4),
-                        "semantic_score": round(result.get("@search.reranker_score", 0), 4),
-                        "title": title,
-                        "file_name": file_name,
-                        "content": content,
-                        "source": result.get("source", ""),
-                        "highlight": best_highlight,
-                        "answers": result.get("@search.answers", []),
-                        "category": result.get("category"),
-                        "total_count": getattr(search_results, "total_count", 0)  # New in 11.5.2
-                    })
-
-            return final_results
-
-        except Exception as e:
-            logger.error(
-                f"Search failed in {index_name} for '{text[:50]}...'",
-                exc_info=True,
-                extra={"query": text, "index": index_name}
-            )
-            return []
-
-
-def get_references(data, organization_id, show_references):
-    print("data => ", data)
-    if isinstance(data, str):
-        data = json.loads(data)
-    references = []
-    unique_references = []
-    for x in data:
-        x['title'] = x['title'] or x['filepath']
-        extension = x['filepath'].split(".")[-1]
-        if show_references and x['content'] not in unique_references:
-            unique_references.append(x['content'])
-            file = SiteDocument.objects.filter(
-                site__organizationbuildinggroup__organization_id=organization_id,
-                file_name__iexact=x['filepath'],
-                ai_processing=AIProcessingChoices.COMPLETED
-            ).first()
-            x['file_url'] = file.document_file.url if file else ""
-            if x['file_url']:
-                x['content'] += "<br><br>"
-                if extension.replace('.', '') in IMAGES_EXTENSIONS:
-                    x['content'] += f"<img src='{x['file_url']}' width='200' height='150' style='object-fit: contain; background: #f9f9f9'>"
-                else:
-                    x['content'] += f"<a href='{x['file_url']}' target='_blank'>Download</a>"
-            references.append(x)
-
-    return references
+# Add clear conversation button
+if st.session_state.messages and st.sidebar.button("Clear Conversation"):
+    st.session_state.messages = []
+    st.session_state.message_count = 0
+    st.session_state.conversation_id = ""
+    st.session_state.new_conversation = True
+    st.rerun()
