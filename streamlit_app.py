@@ -5,7 +5,6 @@ import logging
 import time
 from typing import List, Dict, Optional
 
-from azure.ai.inference import ChatCompletionsClient
 from azure.ai.inference.models import SystemMessage, UserMessage, AssistantMessage
 from azure.core.credentials import AzureKeyCredential
 from azure.core.exceptions import AzureError
